@@ -4201,12 +4201,103 @@ export class Writer {
         }
       }
       const attrs = run ? run.attrs : {};
+      // While a composition holds changes back: text of a node new in this
+      // update (see freshTextAt), written apart from the text around it.
+      let fresh = false;
+      if (this.state.hidden !== null) {
+        const at = this.freshTextAt(atoms, i);
+        fresh = at.fresh;
+        for (const [a] of atoms.textNodes) {
+          if (a > i && a < j && this.freshTextAt(atoms, a).fresh !== fresh) {
+            j = a;
+          }
+        }
+        if (fresh) {
+          j = Math.min(j, at.end);
+        }
+      }
       cursor.insert(
         new ContentString(atoms.text.slice(i, j)),
         this.inheritUnknown(cursor, attrs),
+        fresh,
       );
       i = j;
     }
+  }
+
+  /**
+   * The text this update took from text nodes that existed before it (see
+   * freshTextAt): the whole text of each one it removed, and what each one
+   * it kept lost at its start or end (a cut, the tail of a split). Computed
+   * once per write, while a composition holds changes back only.
+   */
+  private donorTexts: string[] | null = null;
+
+  private $donors(): string[] {
+    if (this.donorTexts === null) {
+      const out: string[] = [];
+      for (const [key, prev] of this.prevState._nodeMap) {
+        if (!$isTextNode(prev) || prev.__text === '') {
+          continue;
+        }
+        const old = prev.__text;
+        const now = $getNodeByKey(key);
+        if (now === null || !now.isAttached() || !$isTextNode(now)) {
+          out.push(old);
+          continue;
+        }
+        const text = now.getTextContent();
+        if (text.length < old.length) {
+          if (old.startsWith(text)) {
+            out.push(old.slice(text.length));
+          } else if (old.endsWith(text)) {
+            out.push(old.slice(0, old.length - text.length));
+          } else {
+            out.push(old);
+          }
+        }
+      }
+      this.donorTexts = out;
+    }
+    return this.donorTexts;
+  }
+
+  /**
+   * Whether desired atom `i` is text of a node new in this update whose
+   * characters descend from no text node that existed before it: not a node
+   * that existed (merged into or not), not a part split off one, and no text
+   * a node removed or cut in this update had (a node replaced by one with a
+   * new key, a copy, a split's tail, an app's re-keying in a read, whatever
+   * text it adds) is in it. Returns it and where that stops being so.
+   */
+  private freshTextAt(atoms: Atoms, i: number): {fresh: boolean; end: number} {
+    for (const [a, b, key] of atoms.textNodes) {
+      if (i < a || i >= b) {
+        continue;
+      }
+      const splits = this.plan.splits;
+      if (
+        this.prevState._nodeMap.has(key) ||
+        (splits !== undefined && splits !== null && splits.has(key)) ||
+        this.splitPart(key)
+      ) {
+        return {end: b, fresh: false};
+      }
+      const text = atoms.text.slice(a, b);
+      const fresh = !this.$donors().some(d => text.includes(d));
+      return {end: b, fresh};
+    }
+    return {end: atoms.length, fresh: false};
+  }
+
+  /** Whether the update's record of text edits says `key` was split off. */
+  private splitPart(key: NodeKey): boolean {
+    for (const e of this.plan.textEdits ?? []) {
+      if (e[0] === 'split' && e[1] !== key && e[2].includes(key)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   /** Format the atoms after `left` whose owned formats differ. */
